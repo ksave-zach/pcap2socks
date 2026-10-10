@@ -1,10 +1,25 @@
 # pcap2socks
 
-**pcap2socks** is a proxy which redirect traffic to a SOCKS proxy with pcap written in Rust.
+**English** | [简体中文](README.zh-CN.md)
+
+**pcap2socks** is a proxy which redirects TCP and UDP traffic to a SOCKS5 proxy with pcap, written in Rust.
 
 You can use [pcap2socks GUI](https://github.com/zhxie/pcap2socks-gui) for a front-end interface.
 
-_pcap2socks is designed to accelerate games in game consoles._
+Originally designed to accelerate games in game consoles, pcap2socks also works well as a lightweight transparent gateway on Linux routers and single-board computers.
+
+This branch is based on [chaos-zhu/pcap2socks](https://github.com/chaos-zhu/pcap2socks), the continuation of the original [zhxie/pcap2socks](https://github.com/zhxie/pcap2socks), and adds long-running stability fixes (see [Changes in this fork](#changes-in-this-fork)).
+
+## Changes in this fork
+
+- **Connection reclamation.** Connections idle for over 10 minutes, or stalled in 8 consecutive unacknowledged retransmissions, are detected by a periodic sweep and cleaned up instead of living forever.
+- **RST storm fix.** Resets for untracked connections are now sent as plain RST carrying the exact expected sequence number, throttled to at most one per second per connection. The previous ACK/RST used a zero acknowledgement number, which an established peer rejects per [RFC 5961](https://datatracker.ietf.org/doc/html/rfc5961) and answers with a challenge ACK, causing an endless RST/ACK storm that stalled the data path.
+- **Bounded connection table.** Concurrent connections are capped at 2048 and further SYNs are rejected with a well-formed RST; a new SYN can replace a connection that has been dead for more than 60 seconds.
+- **LAN traffic stays local.** Traffic to private or link-local destinations is no longer redirected, so LAN traffic never detours through the proxy.
+- **Fragment table cleanup.** Stale IPv4 fragment groups are expired instead of accumulating.
+- **Toolchain updates.** Dependency bumps (pnet 0.34, ipnetwork 0.20).
+
+The fixes have been validated in a long-running deployment on a Linux router.
 
 ## Features
 
@@ -15,13 +30,36 @@ _pcap2socks is designed to accelerate games in game consoles._
 
 ## Dependencies
 
-1. [Npcap](http://www.npcap.org/) or WinPcap in Windows (If using Npcap, make sure to install with the "Install Npcap in WinPcap API-compatible Mode"), libpcap in macOS, Linux and others.
+1. On Windows, [Npcap](http://www.npcap.org/) or WinPcap (if using Npcap, make sure to install with the "Install Npcap in WinPcap API-compatible Mode" option).
+2. On Linux, no external libraries are required (packets are handled with AF_PACKET). Run as root, or grant the binary the capability once:
+   ```
+   sudo setcap cap_net_raw+ep path_to_pcap2socks
+   ```
+3. On macOS, run as root.
 
 ## Build
 
-### Windows
+A recent stable [Rust](https://www.rust-lang.org/) toolchain is required.
 
-If you want to build pcap2socks in Windows, you must meet all the three requirements described in [libpnet](https://github.com/libpnet/libpnet#windows).
+```
+cargo build --release
+```
+
+### Cross-compilation
+
+To build Linux binaries from macOS or Linux with exact glibc versioning, use [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild) together with [Zig](https://ziglang.org/):
+
+```
+# aarch64, glibc 2.36+ (e.g. Debian 12)
+rustup target add aarch64-unknown-linux-gnu
+cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.36
+
+# armv7 hard-float, glibc 2.35+ (e.g. Ubuntu 22.04 on RK3506 boards)
+rustup target add armv7-unknown-linux-gnueabihf
+cargo zigbuild --release --target armv7-unknown-linux-gnueabihf.2.35
+```
+
+Prebuilt Linux binaries are attached to the [Releases](../../releases) page.
 
 ## Usage
 
@@ -31,6 +69,16 @@ pcap2socks -s <ADDRESS>
 # Or a more general one using proxy ARP (recommended)
 pcap2socks -s <ADDRESS> -p <ADDRESS> -d <ADDRESS>
 ```
+
+### Example: Linux router / SBC as a transparent gateway
+
+Run a local SOCKS5 server (for example v2ray, Xray or sing-box) listening on `127.0.0.1:1080`, then start pcap2socks on the interface of the downstream network:
+
+```
+sudo ./pcap2socks -s 192.168.1.1/24 -i eth0 -d 127.0.0.1:1080
+```
+
+Point the gateway and DNS of the devices to be proxied at this machine, and their TCP/UDP traffic will be redirected to the SOCKS5 proxy.
 
 ### Flags
 
@@ -78,6 +126,8 @@ pcap2socks -s <ADDRESS> -p <ADDRESS> -d <ADDRESS>
    setcap cap_net_raw+ep path_to_pcap2socks
    ```
 
+3. Log lines like `Cleaning up N expired TCP connection(s)` (periodic reclamation) and `Too many connections, rejecting SYN` (connection cap reached) are expected behaviours of this fork.
+
 ## Limitations
 
 1. IPv6 is not supported yet.
@@ -92,4 +142,4 @@ pcap2socks -s <ADDRESS> -p <ADDRESS> -d <ADDRESS>
 
 ## License
 
-pcap2socks is licensed under [the MIT License](/LICENSE).
+pcap2socks is licensed under [the MIT License](LICENSE). This branch is based on [zhxie/pcap2socks](https://github.com/zhxie/pcap2socks) and [chaos-zhu/pcap2socks](https://github.com/chaos-zhu/pcap2socks).
