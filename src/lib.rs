@@ -85,6 +85,24 @@ const ENABLE_MSS: bool = true;
 /// Exclude the 4 bytes used in FCS, the minimum frame size in pcap2socks is 60 Bytes.
 const MINIMUM_FRAME_SIZE: usize = 60;
 
+/// Represents the idle timeout of a TCP connection before it is cleaned up.
+/// A connection which makes no progress for this time is regarded as dead, just like devices
+/// which left the network without sending FIN or RST.
+const IDLE_TIMEOUT_SECS: u64 = 600;
+
+/// Represents the maximum count of consecutive retransmissions without acknowledgement progress
+/// of a TCP connection before it is cleaned up.
+const MAX_RETRANS: usize = 8;
+
+/// Represents the interval of the periodic cleanup of expired TCP connections.
+const CLEANUP_INTERVAL_SECS: u64 = 5;
+
+/// Represents the timeout of a dead connection which can be replaced by a duplicated SYN.
+const SYN_REPLACE_TIMEOUT_SECS: u64 = 60;
+
+/// Represents the maximum count of concurrent TCP connections.
+const MAX_CONNECTIONS: usize = 2048;
+
 /// Represents a channel forward traffic to the source in pcap.
 pub struct Forwarder {
     tx: Sender,
@@ -196,6 +214,20 @@ impl Forwarder {
         let key = (src, dst);
 
         self.states.remove(&key);
+    }
+
+    /// Collects expired TCP connections: idle for too long, or stalled in retransmissions.
+    /// Returns the keys of the expired connections in the form of (src, dst).
+    pub fn collect_expired(
+        &self,
+        idle: Duration,
+        max_retrans: usize,
+    ) -> Vec<(SocketAddrV4, SocketAddrV4)> {
+        self.states
+            .iter()
+            .filter(|(_, state)| state.is_expired(idle, max_retrans))
+            .map(|(key, _)| *key)
+            .collect()
     }
 
     /// Returns the source MTU.
@@ -1252,12 +1284,19 @@ impl Redirector {
             self.tx.lock().unwrap().send_gratuitous_arp()?;
         }
 
+        let mut last_cleanup = Instant::now();
+
         loop {
             // Monitor
             if let Some(is_running) = &is_running {
                 if !is_running.load(Ordering::Relaxed) {
                     return Ok(());
                 }
+            }
+            // Periodic cleanup of expired TCP connections
+            if last_cleanup.elapsed().as_secs() >= CLEANUP_INTERVAL_SECS {
+                self.clean_up_expired();
+                last_cleanup = Instant::now();
             }
             match rx.next() {
                 Ok(frame) => {
@@ -1328,6 +1367,14 @@ impl Redirector {
     async fn handle_ipv4(&mut self, indicator: &Indicator, frame: &[u8]) -> io::Result<()> {
         if let Some(ipv4) = indicator.ipv4() {
             let src = ipv4.src();
+            let dst = ipv4.dst();
+            // The traffic from the proxied network to private networks is not redirected,
+            // so that the LAN traffic stays in the LAN.
+            if self.src_ip_addr.contains(src)
+                && (dst.is_private() || dst.is_link_local())
+            {
+                return Ok(());
+            }
             if src != self.local_ip_addr && self.src_ip_addr.contains(src) {
                 let src = ipv4.src();
                 debug!(
@@ -1514,6 +1561,9 @@ impl Redirector {
                                     // Update TCP acknowledgement
                                     tx_state.add_acknowledgement(size as u32);
 
+                                    // Mark the connection as active
+                                    tx_state.touch();
+
                                     // Send delayed ACK0
                                     // If there is a heavy traffic, the ACK reported may be inaccurate, which would results in retransmission
                                     tx_locked.send_tcp_delay_ack_0(dst, src)?;
@@ -1623,8 +1673,37 @@ impl Redirector {
         let key = (src, dst);
         let is_exist = self.streams.get(&key).is_some();
 
-        // Connect if not connected, drop if established
-        if !is_exist {
+        // Drop the SYN if the established connection was active recently; otherwise the dead
+        // connection is cleaned up and replaced by a new one.
+        if is_exist {
+            let is_alive = match self.tx.lock().unwrap().get_state(dst, src) {
+                Some(state) => {
+                    state.last_active().elapsed().as_secs() < SYN_REPLACE_TIMEOUT_SECS
+                }
+                None => false,
+            };
+            if is_alive {
+                return Ok(());
+            }
+
+            self.clean_up(src, dst);
+        }
+
+        // Reject new connections when the limit is reached
+        if self.streams.len() >= MAX_CONNECTIONS {
+            warn!("Too many connections, rejecting SYN of {} -> {}", src, dst);
+            // Reject with RST; sequence 0 and acknowledgement matching the SYN (RFC 793).
+            let _ = self
+                .tx
+                .lock()
+                .unwrap()
+                .send_tcp_ack_rst_untracked(dst, src, 0, tcp.sequence().wrapping_add(1));
+
+            return Ok(());
+        }
+
+        // Connect if not connected
+        if self.streams.get(&key).is_none() {
             // Clean up
             self.clean_up(src, dst);
 
@@ -1821,6 +1900,24 @@ impl Redirector {
         self.states.remove(&key);
 
         self.tx.lock().unwrap().clean_up(dst, src);
+    }
+
+    /// Cleans up TCP connections which are idle for too long or stalled in retransmissions.
+    fn clean_up_expired(&mut self) {
+        let expired = {
+            let tx = self.tx.lock().unwrap();
+            tx.collect_expired(Duration::from_secs(IDLE_TIMEOUT_SECS), MAX_RETRANS)
+        };
+        if expired.is_empty() {
+            return;
+        }
+
+        info!("Cleaning up {} expired TCP connection(s)", expired.len());
+
+        for (src, dst) in expired {
+            let _ = self.tx.lock().unwrap().send_tcp_ack_rst(dst, src);
+            self.clean_up(src, dst);
+        }
     }
 
     async fn handle_udp(&mut self, udp: &Udp, payload: &[u8]) -> io::Result<()> {

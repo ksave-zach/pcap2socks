@@ -572,6 +572,8 @@ pub struct TcpTxState {
     srtt: Option<f64>,
     rttvar: Option<f64>,
     cc: Option<Box<dyn TcpCc>>,
+    last_active: Instant,
+    retrans_count: usize,
 }
 
 impl TcpTxState {
@@ -619,6 +621,8 @@ impl TcpTxState {
                 },
                 false => None,
             },
+            last_active: Instant::now(),
+            retrans_count: 0,
         }
     }
 
@@ -719,6 +723,10 @@ impl TcpTxState {
             .checked_sub(self.cache.sequence())
             .unwrap_or_else(|| sequence + (u32::MAX - self.cache.sequence()));
         if sub_sequence > 0 && sub_sequence as usize <= MAX_U32_WINDOW_SIZE {
+            // The connection made progress
+            self.touch();
+            self.retrans_count = 0;
+
             // Invalidate cache
             let cache_rtt = self.cache.invalidate_to(sequence);
             if rtt.is_none() {
@@ -863,9 +871,30 @@ impl TcpTxState {
         }
     }
 
-    /// Doubles the RTO of the TCP connection.
+    /// Doubles the RTO of the TCP connection, and counts this stalled retransmission.
     pub fn double_rto(&mut self) {
         self.set_rto(self.rto.saturating_mul(2));
+        self.retrans_count = self.retrans_count.saturating_add(1);
+    }
+
+    /// Returns the time the TCP connection was last active.
+    pub fn last_active(&self) -> Instant {
+        self.last_active
+    }
+
+    /// Marks the TCP connection as active.
+    pub fn touch(&mut self) {
+        self.last_active = Instant::now();
+    }
+
+    /// Returns if the TCP connection is expired: idle for too long, or stalled in the
+    /// retransmissions of unacknowledged data.
+    pub fn is_expired(&self, idle: Duration, max_retrans: usize) -> bool {
+        if self.last_active.elapsed() >= idle {
+            return true;
+        }
+
+        !self.cache.is_empty() && self.retrans_count >= max_retrans
     }
 
     /// Updates the RTO of the TCP connection.

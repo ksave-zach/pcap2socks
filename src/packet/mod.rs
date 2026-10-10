@@ -471,6 +471,9 @@ impl Defraggler {
 
         let key = (ipv4.src(), ipv4.dst(), ipv4.kind(), ipv4.identification());
 
+        // Expire stale fragment groups
+        self.frags.retain(|_, frag| !frag.is_expired());
+
         let is_create = match self.frags.get(&key) {
             Some(frag) => frag.is_expired(),
             None => true,
