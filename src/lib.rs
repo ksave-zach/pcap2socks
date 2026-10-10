@@ -13,7 +13,7 @@ use std::net::{Ipv4Addr, Shutdown, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io;
 
 pub mod packet;
@@ -779,9 +779,10 @@ impl Forwarder {
         dst: SocketAddrV4,
         src: SocketAddrV4,
         sequence: u32,
+        acknowledgement: u32,
     ) -> io::Result<()> {
         // TCP
-        let tcp = Tcp::new_ack_rst(dst.port(), src.port(), sequence, 0, 0, None);
+        let tcp = Tcp::new_ack_rst(dst.port(), src.port(), sequence, acknowledgement, 0, None);
 
         // Send
         self.send_ipv4(*dst.ip(), *src.ip(), Layers::Tcp(tcp), None)
@@ -1194,6 +1195,9 @@ pub struct Redirector {
     defrag: Defraggler,
     traffic_size: Option<Arc<AtomicUsize>>,
     traffic_count: Option<Arc<AtomicUsize>>,
+    /// Represents the per-connection cooldown of untracked RST responses, used to avoid
+    /// RST/ACK challenge storms.
+    rst_cooldowns: HashMap<(SocketAddrV4, SocketAddrV4), Instant>,
 }
 
 impl Redirector {
@@ -1223,6 +1227,7 @@ impl Redirector {
             defrag: Defraggler::new(),
             traffic_size: size,
             traffic_count: count,
+            rst_cooldowns: HashMap::new(),
         };
         if let Some(gw_ip_addr) = gw_ip_addr {
             redirector.tx.lock().unwrap().set_local_ip_addr(gw_ip_addr);
@@ -1605,11 +1610,8 @@ impl Redirector {
                 self.handle_tcp_fin(tcp, payload)?;
             }
         } else {
-            // Send ACK/RST
-            self.tx
-                .lock()
-                .unwrap()
-                .send_tcp_ack_rst_untracked(dst, src, tcp.acknowledgement())?;
+            // Send RST (plain, with the peer's expected sequence; throttled)
+            self.send_untracked_rst_throttled(dst, src, tcp.acknowledgement())?;
         }
 
         Ok(())
@@ -1698,27 +1700,10 @@ impl Redirector {
     fn handle_tcp_rst(&mut self, tcp: &Tcp) {
         let src = SocketAddrV4::new(tcp.src_ip_addr(), tcp.src());
         let dst = SocketAddrV4::new(tcp.dst_ip_addr(), tcp.dst());
-        let key = (src, dst);
 
-        if tcp.is_ack() {
-            match self.states.get(&key) {
-                Some(state) => {
-                    // Exam ACK
-                    if tcp.sequence() == state.recv_next() {
-                        // Admit RST
-                        // Clean up
-                        self.clean_up(src, dst);
-                    }
-                }
-                None => {
-                    // Clean up
-                    self.clean_up(src, dst);
-                }
-            }
-        } else {
-            // Clean up
-            self.clean_up(src, dst);
-        }
+        // A RST always tears the connection down. The sequence of a RST is not examined since a
+        // mismatched sequence just indicates the connection is out of sync.
+        self.clean_up(src, dst);
     }
 
     fn handle_tcp_fin(&mut self, tcp: &Tcp, payload: &[u8]) -> io::Result<()> {
@@ -1796,14 +1781,37 @@ impl Redirector {
                 self.tx.lock().unwrap().send_tcp_ack_0(dst, src)?;
             }
         } else {
-            // Send ACK/RST
-            self.tx
-                .lock()
-                .unwrap()
-                .send_tcp_ack_rst_untracked(dst, src, tcp.acknowledgement())?;
+            // Send RST (plain, with the peer's expected sequence; throttled)
+            self.send_untracked_rst_throttled(dst, src, tcp.acknowledgement())?;
         }
 
         Ok(())
+    }
+
+    /// Sends a RST for an untracked connection, throttled per connection to avoid
+    /// RST/ACK challenge storms with the peer stack.
+    fn send_untracked_rst_throttled(
+        &mut self,
+        dst: SocketAddrV4,
+        src: SocketAddrV4,
+        sequence: u32,
+    ) -> io::Result<()> {
+        let key = (src, dst);
+        let now = Instant::now();
+        if let Some(cooldown) = self.rst_cooldowns.get(&key) {
+            if now.duration_since(*cooldown) < Duration::from_secs(1) {
+                return Ok(());
+            }
+        }
+        if self.rst_cooldowns.len() > 1024 {
+            self.rst_cooldowns
+                .retain(|_, cooldown| now.duration_since(*cooldown) < Duration::from_secs(30));
+        }
+        self.rst_cooldowns.insert(key, now);
+
+        // Plain RST (no ACK flag): the peer validates it against the expected sequence
+        // number only, accepts it, and terminates the connection immediately.
+        self.tx.lock().unwrap().send_tcp_rst(dst, src, sequence)
     }
 
     fn clean_up(&mut self, src: SocketAddrV4, dst: SocketAddrV4) {
